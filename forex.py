@@ -1,163 +1,154 @@
 """
-forex.py — Koneksi ke Exness via MetaTrader5 API.
-
-Kredensial akun demo:
-  Login  : 433418879
-  Server : Exness-MT5Trial7
+forex.py — Koneksi ke Exness via TradeLocker HTTP API.
+Tidak butuh MetaTrader5 — berjalan di Linux/GitHub Actions.
 """
 
+import requests
 import logging
-import subprocess
-import sys
-import os
 
 logger = logging.getLogger(__name__)
 
-# Auto-install MetaTrader5 jika belum ada (untuk GitHub Actions)
-try:
-    import MetaTrader5 as mt5
-except ImportError:
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "MetaTrader5"])
-    import MetaTrader5 as mt5
+# TradeLocker adalah platform web Exness yang punya REST API
+TRADELOCKER_BASE = "https://demo.tradelocker.com/backend-service"
 
 
 class ForexTrader:
     def __init__(self, login: int, password: str, server: str):
-        self.login    = login
+        self.login    = str(login)
         self.password = password
         self.server   = server
-        self._connected = False
+        self.session  = requests.Session()
+        self.token    = None
+        self.acc_id   = None
+        self.acc_num  = None
         self._connect()
 
     def _connect(self):
-        """Konek ke MT5."""
-        if not mt5.initialize():
-            logger.error(f"MT5 initialize gagal: {mt5.last_error()}")
-            return
+        """Login ke TradeLocker dan ambil token."""
+        try:
+            resp = self.session.post(
+                f"{TRADELOCKER_BASE}/auth/jwt/token",
+                json={
+                    "email":       self.login,
+                    "password":    self.password,
+                    "server":      self.server,
+                },
+                timeout=15
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            self.token = data.get("accessToken")
 
-        authorized = mt5.login(
-            login=self.login,
-            password=self.password,
-            server=self.server
-        )
-        if authorized:
-            info = mt5.account_info()
-            logger.info(f"✅ MT5 terhubung: #{info.login} | "
-                        f"Balance: ${info.balance:.2f} | Server: {info.server}")
-            self._connected = True
-        else:
-            logger.error(f"❌ MT5 login gagal: {mt5.last_error()}")
+            if not self.token:
+                logger.error(f"Login gagal: {data}")
+                return
+
+            self.session.headers.update({
+                "Authorization": f"Bearer {self.token}",
+                "Content-Type":  "application/json",
+            })
+
+            # Ambil account info
+            acc_resp = self.session.get(
+                f"{TRADELOCKER_BASE}/auth/jwt/all-accounts",
+                timeout=10
+            )
+            acc_resp.raise_for_status()
+            accounts = acc_resp.json().get("accounts", [])
+            if accounts:
+                self.acc_id  = accounts[0]["id"]
+                self.acc_num = accounts[0]["accNum"]
+                logger.info(f"✅ TradeLocker terhubung: akun #{self.acc_num}")
+            else:
+                logger.error("Tidak ada akun ditemukan.")
+
+        except Exception as e:
+            logger.error(f"Koneksi TradeLocker gagal: {e}")
 
     def get_price(self, symbol: str) -> float | None:
         """Ambil harga terkini."""
-        if not self._connected:
+        if not self.token or not self.acc_id:
             return None
-        # Konversi format: EUR_USD → EURUSD
-        symbol = symbol.replace("_", "")
-        tick = mt5.symbol_info_tick(symbol)
-        if tick:
-            return (tick.bid + tick.ask) / 2
-        logger.error(f"Gagal ambil harga {symbol}: {mt5.last_error()}")
-        return None
+        sym = symbol.replace("_", "")
+        try:
+            resp = self.session.get(
+                f"{TRADELOCKER_BASE}/trade/quotes",
+                params={"symbol": sym, "accNum": self.acc_num},
+                timeout=10
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            bid = float(data.get("bid", 0))
+            ask = float(data.get("ask", 0))
+            return (bid + ask) / 2
+        except Exception as e:
+            logger.error(f"Gagal ambil harga {sym}: {e}")
+            return None
 
     def place_order(self, instrument: str, units: int,
                     stop_loss: float = None,
                     take_profit: float = None) -> dict | None:
-        """
-        Buat market order.
-        units positif = BUY, negatif = SELL
-        """
-        if not self._connected:
-            logger.error("MT5 tidak terhubung.")
+        """Buat market order. units positif=BUY, negatif=SELL."""
+        if not self.token or not self.acc_id:
+            logger.error("Tidak terhubung ke TradeLocker.")
             return None
 
-        symbol = instrument.replace("_", "")
-        action = mt5.ORDER_TYPE_BUY if units > 0 else mt5.ORDER_TYPE_SELL
-        volume = abs(units) / 100000  # konversi units ke lot (1 lot = 100000)
-        volume = max(0.01, round(volume, 2))  # minimum 0.01 lot
+        sym    = instrument.replace("_", "")
+        side   = "buy" if units > 0 else "sell"
+        volume = abs(units) / 100000
+        volume = max(0.01, round(volume, 2))
 
-        # Ambil harga
-        tick = mt5.symbol_info_tick(symbol)
-        if not tick:
-            logger.error(f"Tidak bisa ambil tick {symbol}")
+        price = self.get_price(instrument)
+        if not price:
             return None
 
-        price = tick.ask if units > 0 else tick.bid
+        pip = 0.01 if "JPY" in sym else 0.0001
+        sl  = stop_loss   or (price - 30 * pip if units > 0 else price + 30 * pip)
+        tp  = take_profit or (price + 60 * pip if units > 0 else price - 60 * pip)
 
-        # Hitung SL/TP otomatis jika tidak diberikan
-        pip  = 0.01 if "JPY" in symbol else 0.0001
-        sl   = stop_loss   or (price - 30 * pip if units > 0 else price + 30 * pip)
-        tp   = take_profit or (price + 60 * pip if units > 0 else price - 60 * pip)
-
-        request = {
-            "action":     mt5.TRADE_ACTION_DEAL,
-            "symbol":     symbol,
-            "volume":     volume,
-            "type":       action,
-            "price":      price,
-            "sl":         round(sl, 5),
-            "tp":         round(tp, 5),
-            "deviation":  20,
-            "magic":      20250101,
-            "comment":    "polymarket-bot",
-            "type_time":  mt5.ORDER_TIME_GTC,
-            "type_filling": mt5.ORDER_FILLING_IOC,
-        }
-
-        result = mt5.order_send(request)
-        if result and result.retcode == mt5.TRADE_RETCODE_DONE:
-            logger.info(f"✅ Order berhasil: {symbol} {volume} lot @ {result.price}")
-            return {"price": str(result.price), "order": result.order}
-        else:
-            logger.error(f"❌ Order gagal: {result.retcode if result else mt5.last_error()}")
+        try:
+            resp = self.session.post(
+                f"{TRADELOCKER_BASE}/trade/orders",
+                json={
+                    "accNum":      self.acc_num,
+                    "instrument":  sym,
+                    "type":        "market",
+                    "side":        side,
+                    "qty":         volume,
+                    "stopLoss":    round(sl, 5),
+                    "takeProfit":  round(tp, 5),
+                },
+                timeout=15
+            )
+            resp.raise_for_status()
+            result = resp.json()
+            logger.info(f"✅ Order: {sym} {side} {volume} lot")
+            return {"price": str(price), "order": result}
+        except Exception as e:
+            logger.error(f"Order gagal: {e}")
             return None
-
-    def get_open_trades(self) -> list:
-        """Ambil posisi terbuka."""
-        if not self._connected:
-            return []
-        positions = mt5.positions_get()
-        return list(positions) if positions else []
 
     def get_account_summary(self) -> dict:
         """Ringkasan akun."""
-        if not self._connected:
+        if not self.token or not self.acc_id:
             return {}
-        info = mt5.account_info()
-        if info:
+        try:
+            resp = self.session.get(
+                f"{TRADELOCKER_BASE}/trade/accounts/{self.acc_id}",
+                params={"accNum": self.acc_num},
+                timeout=10
+            )
+            resp.raise_for_status()
+            data = resp.json()
             return {
-                "balance":       info.balance,
-                "nav":           info.equity,
-                "unrealized_pl": info.profit,
-                "open_trades":   info.positions_total,
+                "balance":       data.get("balance"),
+                "nav":           data.get("equity"),
+                "unrealized_pl": data.get("unrealizedPnl"),
+                "open_trades":   data.get("positionsCount"),
             }
-        return {}
-
-    def get_candles(self, symbol: str, timeframe=None, count: int = 60) -> list:
-        """Ambil data candle untuk indikator teknikal."""
-        if not self._connected:
-            return []
-        sym = symbol.replace("_", "")
-        tf  = timeframe or mt5.TIMEFRAME_H1
-        rates = mt5.copy_rates_from_pos(sym, tf, 0, count)
-        if rates is None:
-            return []
-        return [float(r["close"]) for r in rates]
-
-    def get_hlc_candles(self, symbol: str, timeframe=None, count: int = 20):
-        """Ambil high, low, close untuk ATR."""
-        if not self._connected:
-            return [], [], []
-        sym = symbol.replace("_", "")
-        tf  = timeframe or mt5.TIMEFRAME_H1
-        rates = mt5.copy_rates_from_pos(sym, tf, 0, count)
-        if rates is None:
-            return [], [], []
-        highs  = [float(r["high"])  for r in rates]
-        lows   = [float(r["low"])   for r in rates]
-        closes = [float(r["close"]) for r in rates]
-        return highs, lows, closes
+        except Exception as e:
+            logger.error(f"Gagal ambil summary: {e}")
+            return {}
 
     def disconnect(self):
-        mt5.shutdown()
-        logger.info("MT5 disconnected.")
+        logger.info("Trader disconnected.")
