@@ -1,0 +1,14 @@
+# Jangan commit file sensitif ini!
+.env
+prob_history.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# Logs (opsional — hapus baris ini jika ingin simpan log di repo)
+logs/
