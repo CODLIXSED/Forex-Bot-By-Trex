@@ -1,5 +1,5 @@
 """
-run_once.py — Versi bot untuk GitHub Actions (berjalan sekali).
+run_once.py — Untuk GitHub Actions (berjalan sekali).
 """
 
 import json
@@ -14,7 +14,7 @@ from strategy import TradingStrategy
 from logger import setup_logger
 from telegram_notify import TelegramNotifier
 
-logger   = setup_logger()
+logger       = setup_logger()
 HISTORY_FILE = "prob_history.json"
 
 
@@ -33,12 +33,18 @@ def save_history(history):
 def main():
     logger.info("=" * 55)
     logger.info(f"🚀 Run: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info(f"DryRun: {Config.DRY_RUN} | Threshold: {Config.MIN_SCORE_THRESHOLD}/100")
 
     tg = TelegramNotifier(Config.TELEGRAM_TOKEN, Config.TELEGRAM_CHAT_ID)
 
+    # Konek ke Exness MT5
+    trader = ForexTrader(
+        login=Config.MT5_LOGIN,
+        password=Config.MT5_PASSWORD,
+        server=Config.MT5_SERVER,
+    )
+
     poly     = PolymarketMonitor()
-    trader   = ForexTrader(Config.OANDA_API_KEY, Config.OANDA_ACCOUNT_ID,
-                           Config.PRACTICE_MODE)
     strategy = TradingStrategy()
     history  = load_history()
 
@@ -66,36 +72,36 @@ def main():
 
         # Analisis multi-faktor
         signal = strategy.analyze(market, odds, prob_history=history[cid])
-
         if not signal:
             continue
 
         any_signal = True
-
-        # Kirim notifikasi sinyal ke Telegram
         tg.signal(signal)
 
         if Config.DRY_RUN:
             logger.info(f"  [DRY RUN] {signal['action']} {signal['pair']} "
                         f"| units: {signal['units']} | skor: {signal['score']:.1f}")
-            tg.send(f"🧪 <b>DRY RUN</b> — tidak ada order sungguhan.")
+            tg.send("🧪 <b>DRY RUN</b> — tidak ada order sungguhan.")
         else:
             units  = signal["units"] if signal["action"] == "BUY" else -signal["units"]
             result = trader.place_order(signal["pair"], units)
             if result:
-                price = result.get("price", "?")
-                logger.info(f"  ✅ Order berhasil @ {price}")
-                tg.order_success(signal["pair"], signal["action"], signal["units"], price)
+                tg.order_success(signal["pair"], signal["action"],
+                                 signal["units"], result.get("price", "?"))
             else:
-                logger.error(f"  ❌ Order gagal")
                 tg.order_failed(signal["pair"], signal["action"])
 
     if not any_signal:
         logger.info("\nℹ️  Tidak ada sinyal valid.")
-        # Kirim notif "tidak ada sinyal" hanya jika diaktifkan
         if Config.NOTIFY_NO_SIGNAL:
             tg.no_signal()
 
+    # Ringkasan akun
+    summary = trader.get_account_summary()
+    if summary:
+        logger.info(f"\n💰 Balance: {summary['balance']} | PnL: {summary['unrealized_pl']}")
+
+    trader.disconnect()
     logger.info("\n✅ Run selesai.")
 
 
